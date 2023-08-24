@@ -1,0 +1,8 @@
+[package]
+name = "messaging"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+futures = "0.3.28"
+codec = { package = "parity-scale-codec", version = "3.6.4", features = [ "derive" ] }
