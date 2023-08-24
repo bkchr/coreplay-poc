@@ -57,3 +57,6 @@ The executor will load the `task` from the `target` directory. Thus, the `task` 
 reuse our memory and call our `service` function. It looks like the `TLS` maybe got destroyed in between?
 - How to snapshot/restore the memory. Actually snapshoting should be easy, but restoring it on a different machine should be more complicated as pointers inside wasm maybe using the real memory location
 and are not "relative".
+- How to handle panic? We probably need to clean the entire memory and let the task completely restart. The proper solution for sure would be to not panic :P 
+  - We could maybe also provide some sort of checkpointing host function. The task calls this and then it could be restored at this point. Maybe also with a hint or similar on what it will process. For example
+  it will start to process a message and will panic. The host could be informed in this way that this message is bad. However, we could not do this for questions that require delivery (XCMP).
