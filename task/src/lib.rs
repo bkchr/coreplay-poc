@@ -8,22 +8,18 @@
 
 use futures::{executor::block_on, future::BoxFuture, pin_mut, poll, select_biased, FutureExt};
 use messaging::{next_message, send_message, Message};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 /// The main `future` is stored inside this `static`.
 static mut MAIN: OnceLock<BoxFuture<()>> = OnceLock::new();
-/// Use this as `yield` signal for now.
-///
-/// A proper implementation should properly abstract over this. We should provide some kind of custom `Yield` struct for doing manual yielding.
-/// Another idea could be some kind of attribute macro that could be placed above async functions to let them automatially yield.
-static YIELD: AtomicBool = AtomicBool::new(false);
 
-/// Debugging support
+/// Host functions
 mod host_function {
     extern "C" {
         /// Print the given string.
         pub fn print(msg: *const u8, len: u32);
+        /// Returns `1` when program is expected to `yield`.
+        pub fn should_yield() -> u32;
     }
 }
 
@@ -43,9 +39,6 @@ pub unsafe extern "C" fn service() {
         print(&message);
     }));
 
-    // TODO: There is a potential race condition if `yield` is called before this is called.
-    YIELD.store(false, Ordering::Relaxed);
-
     // Either re-use the already active `Future` or start the `future`.
     if let Some(future) = MAIN.get_mut() {
         print("Poll");
@@ -63,19 +56,12 @@ pub unsafe extern "C" fn service() {
     }
 }
 
-/// Inform the task that it is time to yield.
-#[no_mangle]
-#[export_name = "yield"]
-pub unsafe extern "C" fn yield_() {
-    YIELD.store(true, Ordering::Relaxed);
-}
-
 /// Maybe yield, depending on if the `executor` requested us to `yield` or not.
 ///
 /// `Yield` means that this function will return `Poll::Pending` to give back
 /// the control to the `executor`.
 async fn maybe_yield() {
-    let _yield = YIELD.load(Ordering::Relaxed);
+    let _yield = unsafe { host_function::should_yield() == 1 };
 
     if _yield {
         // Yielding is just done by returning `Pending`.

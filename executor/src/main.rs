@@ -9,6 +9,7 @@ use futures::{pin_mut, select, FutureExt};
 use messaging::Message;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::runtime::Handle;
 use wasmtime::*;
 
 /// The inner of [`StoreData`].
@@ -17,6 +18,7 @@ struct StoreDataInner {
     messages: Vec<Message>,
     messages_to_send: Vec<Message>,
     name: String,
+    should_yield: bool,
 }
 
 /// The data that is passed to our host calls.
@@ -27,7 +29,6 @@ struct StoreData(Arc<Mutex<StoreDataInner>>);
 struct Task {
     name: String,
     store_data: StoreData,
-    yield_fn: Func,
     service_fn: Option<Func>,
 }
 
@@ -51,6 +52,10 @@ impl Task {
 
     fn drain_messages_to_send(&self) -> Vec<Message> {
         std::mem::take(&mut self.store_data.0.lock().unwrap().messages_to_send)
+    }
+
+    fn set_yield(&self, _yield: bool) {
+        self.store_data.0.lock().unwrap().should_yield = _yield;
     }
 }
 
@@ -147,6 +152,15 @@ fn create_linker(
         },
     )?;
 
+    // Register the `should_yield` function.
+    linker.func_wrap("env", "should_yield", |caller: Caller<'_, StoreData>| {
+        if caller.data().0.lock().unwrap().should_yield {
+            1u32
+        } else {
+            0u32
+        }
+    })?;
+
     linker.define(store, "env", "memory", shared_memory.clone())?;
 
     Ok(linker)
@@ -164,26 +178,6 @@ async fn service_fn(
     let instance = linker.instantiate_async(&mut store, module).await?;
 
     let func = instance.get_typed_func(&mut store, "service")?;
-
-    Ok(Func {
-        func,
-        store,
-        _instance: instance,
-    })
-}
-
-/// Create an instance of `Func` that holds the `yield` function.
-async fn yield_fn(
-    store_data: &StoreData,
-    engine: &Engine,
-    module: &Module,
-    shared_memory: &SharedMemory,
-) -> Result<Func> {
-    let mut store = Store::new(engine, store_data.clone());
-    let linker = create_linker(&mut store, engine, shared_memory)?;
-    let instance = linker.instantiate_async(&mut store, module).await?;
-
-    let func = instance.get_typed_func(&mut store, "yield")?;
 
     Ok(Func {
         func,
@@ -214,16 +208,15 @@ async fn create_task(name: impl Into<String>) -> Result<Task> {
         memory: shared_memory.clone(),
         messages_to_send: Vec::new(),
         messages: Vec::new(),
+        should_yield: false,
     })));
 
     // TODO: Find out why changing the order of these functions make the TLS fail.
     let service_fn = service_fn(&store_data, &engine, &module, &shared_memory).await?;
-    let yield_fn = yield_fn(&store_data, &engine, &module, &shared_memory).await?;
 
     Ok(Task {
         name,
         store_data,
-        yield_fn,
         service_fn: Some(service_fn),
     })
 }
@@ -252,16 +245,18 @@ async fn main() -> Result<()> {
 
         println!("Scheduling task: {}", task.name);
 
+        // Reset the `yield` signal.
+        task.set_yield(false);
         let mut service_fn = task.service_fn.take().unwrap();
 
         // We need to `spawn` the `service` function. While the `call` function is async,
         // `wasmtime` still runs the wasm execution in the `poll` function.
         // Thus, to not block our execution we need to run it on another thread.
-        //
-        // Should use `spawn_blocking` in the future.
-        let service_call = tokio::task::spawn(async move {
-            service_fn.call().await?;
-            Ok::<_, anyhow::Error>(service_fn)
+        let service_call = tokio::task::spawn_blocking(move || {
+            Handle::current().block_on(async move {
+                service_fn.call().await?;
+                Ok::<_, anyhow::Error>(service_fn)
+            })
         })
         .fuse();
         // Let's give each task `100ms`.
@@ -280,7 +275,7 @@ async fn main() -> Result<()> {
             _ = timeout => {
                 println!("Yielding task {}", task.name);
                 // Let's set the yield signal.
-                task.yield_fn.call().await?;
+                task.set_yield(true);
                 // Wait until the `service` function returns.
                 task.service_fn = Some(service_call.await??);
             }
