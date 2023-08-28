@@ -19,7 +19,17 @@ mod host_function {
         /// `msg` is the SCALE encoded message.
         /// `len` is the lenght of the SCALE encoded message.
         pub fn send_message(msg: *const u8, len: u32);
+
+        pub fn call_task(task: *const u8, call: *const u8, len: u32, result: *mut u8) -> u32;
     }
+}
+
+/// The ID of a task.
+pub type TaskId = [u8; 256];
+
+#[derive(Encode, Decode)]
+pub enum CallError {
+    ResultDecoding,
 }
 
 /// Our glorious message type.
@@ -51,4 +61,25 @@ pub fn send_message(msg: Message) {
     let encoded = msg.encode();
 
     unsafe { host_function::send_message(encoded.as_ptr(), encoded.len() as u32) };
+}
+
+pub fn call_task<R: Decode>(task: TaskId, msg: &impl Encode) -> Result<R, CallError> {
+    let mut result_buffer = vec![0; 4096];
+    let msg = msg.encode();
+
+    let result_len = unsafe {
+        host_function::call_task(
+            task.as_ptr(),
+            msg.as_ptr(),
+            msg.len() as u32,
+            result_buffer.as_mut_ptr(),
+        ) as usize
+    };
+
+    if result_len > result_buffer.len() {
+        unimplemented!("Implement")
+    }
+
+    Result::<R, CallError>::decode(&mut &result_buffer[..result_len])
+        .map_err(|_| CallError::ResultDecoding)
 }
