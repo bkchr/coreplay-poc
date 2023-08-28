@@ -25,7 +25,7 @@ mod host_function {
 }
 
 /// The ID of a task.
-pub type TaskId = [u8; 256];
+pub type TaskId = [u8; 32];
 
 #[derive(Encode, Decode)]
 pub enum CallError {
@@ -81,5 +81,5 @@ pub fn call_task<R: Decode>(task: TaskId, msg: &impl Encode) -> Result<R, CallEr
     }
 
     Result::<R, CallError>::decode(&mut &result_buffer[..result_len])
-        .map_err(|_| CallError::ResultDecoding)
+        .map_err(|_| CallError::ResultDecoding)?
 }

@@ -6,12 +6,56 @@
 //!
 //! At the bottom of this file we have our user logic.
 
-use futures::{executor::block_on, future::BoxFuture, pin_mut, poll, select_biased, FutureExt};
+use futures::{
+    channel::mpsc, executor::block_on, future::BoxFuture, pin_mut, poll, select_biased, FutureExt,
+};
 use messaging::{next_message, send_message, Message};
-use std::sync::OnceLock;
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex, OnceLock},
+};
 
-/// The main `future` is stored inside this `static`.
-static mut MAIN: OnceLock<BoxFuture<()>> = OnceLock::new();
+/// The context describing the relay chain in which the `service` function was called.
+struct RelayChainContext {
+    // Could probably contain stuff like block number and storage root to read information from the relay chain.
+}
+
+#[derive(Default)]
+struct MessagesInner {
+    relay_chain_contexts: VecDeque<RelayChainContext>,
+}
+
+enum IMessage {
+    Context(RelayChainContext),
+    Extern(Message),
+}
+
+#[derive(Clone, Default)]
+struct Messages {
+    inner: Arc<Mutex<MessagesInner>>,
+}
+
+impl Messages {
+    async fn next(&self) -> IMessage {
+        if let Some(context) = self.inner.lock().unwrap().relay_chain_contexts.pop_front() {
+            return IMessage::Context(context);
+        }
+
+        IMessage::Extern(next_message().await)
+    }
+}
+
+struct Context<UserContext> {
+    main_fn: BoxFuture<'static, ()>,
+    user_context: UserContext,
+    yielded: bool,
+    messages: Messages,
+}
+
+environmental::environmental!(YIELDED: bool);
+
+/// The context holding all the information.
+static mut CONTEXT: OnceLock<Context<()>> = OnceLock::new();
 
 /// Host functions
 mod host_function {
@@ -39,19 +83,32 @@ pub unsafe extern "C" fn service() {
         print(&message);
     }));
 
-    // Either re-use the already active `Future` or start the `future`.
-    if let Some(future) = MAIN.get_mut() {
-        print("Poll");
-        block_on(async {
-            let _ = poll!(future);
-        });
+    if let Some(context) = CONTEXT.get_mut() {
+        // First reset.
+        context.yielded = false;
+        YIELDED::using_once(&mut context.yielded, || {
+            block_on(async {
+                let _ = poll!(&mut context.main_fn);
+            });
+        })
     } else {
-        print("Init");
-        let mut future = main().boxed();
-        block_on(async {
-            let _ = poll!(&mut future);
+        let messages = Messages::default();
+        let mut future = main(messages.clone()).boxed();
+        let mut yielded = false;
+
+        YIELDED::using_once(&mut yielded, || {
+            block_on(async {
+                let _ = poll!(&mut future);
+            });
         });
-        MAIN.set(future)
+
+        CONTEXT
+            .set(Context {
+                main_fn: future,
+                user_context: (),
+                yielded,
+                messages,
+            })
             .unwrap_or_else(|_| panic!("There is no `MAIN` set"));
     }
 }
@@ -64,6 +121,8 @@ async fn maybe_yield() {
     let _yield = unsafe { host_function::should_yield() == 1 };
 
     if _yield {
+        YIELDED::with(|y| *y = true).expect("Called in a `service` provided context");
+
         // Yielding is just done by returning `Pending`.
         futures::pending!()
     }
@@ -75,7 +134,7 @@ async fn maybe_yield() {
 // --------------------------------------------------------------------
 
 /// The main function of our task.
-async fn main() {
+async fn main(messages: Messages) {
     let never_return = never_return().fuse();
     pin_mut!(never_return);
 
@@ -83,9 +142,16 @@ async fn main() {
     loop {
         select_biased! {
             // First, poll for messages
-            message = next_message().fuse() => match message {
-                Message::Ping => { send_message(Message::Pong); },
-                Message::Pong => { send_message(Message::Ping); },
+            message = messages.next().fuse() => {
+                match message {
+                    IMessage::Context(_) => {},
+                    IMessage::Extern(message) => {
+                        match message {
+                            Message::Ping => { send_message(Message::Pong); },
+                            Message::Pong => { send_message(Message::Ping); },
+                        }
+                    }
+                }
             },
             _ = never_return => {},
         }

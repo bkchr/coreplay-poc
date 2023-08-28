@@ -5,12 +5,23 @@
 
 use anyhow::Result;
 use codec::{Decode, Encode};
-use futures::{pin_mut, select, FutureExt};
-use messaging::Message;
-use std::sync::{Arc, Mutex};
+use futures::{
+    channel::{mpsc, oneshot},
+    pin_mut, select, FutureExt, SinkExt,
+};
+use messaging::{Message, TaskId};
+use std::{sync::{Arc, Mutex}, collections::HashMap};
 use std::time::Duration;
 use tokio::runtime::Handle;
 use wasmtime::*;
+
+enum TaskRequest {
+    Call {
+        target: TaskId,
+        call: Vec<u8>,
+        result: oneshot::Sender<Vec<u8>>,
+    },
+}
 
 /// The inner of [`StoreData`].
 struct StoreDataInner {
@@ -19,6 +30,7 @@ struct StoreDataInner {
     messages_to_send: Vec<Message>,
     name: String,
     should_yield: bool,
+    request_sender: mpsc::Sender<TaskRequest>,
 }
 
 /// The data that is passed to our host calls.
@@ -161,6 +173,69 @@ fn create_linker(
         }
     })?;
 
+    linker.func_wrap4_async(
+        "env",
+        "call_task",
+        |caller: Caller<'_, StoreData>,
+         target: u32,
+         call_ptr: u32,
+         call_len: u32,
+         result_ptr: u32| {
+            if call_ptr == 0 || call_len == 0 || result_ptr == 0 || target == 0 {
+                panic!("Invalid `call_task` argument");
+            }
+
+            let store_data = (*caller.data()).clone();
+            let store = store_data.0.lock().unwrap();
+            let mut buffer = vec![0; call_len as usize];
+            let mut target_task: TaskId = [0u8; 32];
+
+            unsafe {
+                let memory: *mut u8 = std::mem::transmute(store.memory.data().as_ptr());
+
+                // Our memory location is a local variable in wasm, thus this is safe.
+                memory
+                    .offset(call_ptr as isize)
+                    .copy_to(buffer.as_mut_ptr(), call_len as usize);
+
+                memory
+                    .offset(target as isize)
+                    .copy_to(target_task.as_mut_ptr(), target_task.len());
+            }
+
+            let mut sender = store.request_sender.clone();
+            drop(store);
+
+            Box::new(async move {
+                let (result_sender, result_recv) = oneshot::channel();
+
+                sender
+                    .send(TaskRequest::Call {
+                        target: target_task,
+                        call: buffer,
+                        result: result_sender,
+                    })
+                    .await.unwrap();
+
+                let result = result_recv.await.unwrap();
+
+                let store = store_data.0.lock().unwrap();
+
+                unsafe {
+                    let memory: *mut u8 = std::mem::transmute(store.memory.data().as_ptr());
+
+                    // Our memory location is a local variable in wasm, thus this is safe.
+                    memory
+                        .offset(result_ptr as isize)
+                        .copy_from(result.as_ptr(), result.len());
+                }
+                drop(store);
+
+                result.len() as u32
+            })
+        },
+    )?;
+
     linker.define(store, "env", "memory", shared_memory.clone())?;
 
     Ok(linker)
@@ -187,7 +262,10 @@ async fn service_fn(
 }
 
 /// Create a task with the given `name`.
-async fn create_task(name: impl Into<String>) -> Result<Task> {
+async fn create_task(
+    name: impl Into<String>,
+    request_sender: mpsc::Sender<TaskRequest>,
+) -> Result<Task> {
     let mut config = Config::default();
     config.async_support(true);
     config.wasm_threads(true);
@@ -209,6 +287,7 @@ async fn create_task(name: impl Into<String>) -> Result<Task> {
         messages_to_send: Vec::new(),
         messages: Vec::new(),
         should_yield: false,
+        request_sender,
     })));
 
     // TODO: Find out why changing the order of these functions make the TLS fail.
@@ -225,19 +304,25 @@ async fn create_task(name: impl Into<String>) -> Result<Task> {
 async fn main() -> Result<()> {
     println!("Initializing...");
 
-    let task_a = create_task("task_a").await?;
-    let task_b = create_task("task_b").await?;
+    let (request_sender, request_recv) = mpsc::channel(1);
+
+    let task_a = create_task("task_a", request_sender.clone()).await?;
+    let task_b = create_task("task_b", request_sender.clone()).await?;
 
     // Let's start with some message for `task_a`.
     task_a.send_message(Message::Ping);
 
-    let mut tasks = vec![task_a, task_b];
+    let mut tasks = HashMap::new();
+
+    tasks.insert([1; 32], task_a);
+    tasks.insert([2; 32], task_b);
+
     let mut messages_to_send = vec![];
 
     // Interleave the execution between both tasks.
     for task_i in 0.. {
         let index = task_i % tasks.len();
-        let task = &mut tasks[index];
+        let task = &mut tasks.values_mut().nth(index).unwrap();
 
         messages_to_send
             .drain(..)
