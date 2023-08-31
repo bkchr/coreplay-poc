@@ -27,7 +27,7 @@ mod host_function {
 /// The ID of a task.
 pub type TaskId = [u8; 32];
 
-#[derive(Encode, Decode)]
+#[derive(Encode, Decode, Debug)]
 pub enum CallError {
     ResultDecoding,
 }
@@ -37,6 +37,7 @@ pub enum CallError {
 pub enum Message {
     Ping,
     Pong,
+    Call(TaskId),
 }
 
 /// Fetches the next message.

@@ -6,10 +6,12 @@
 //!
 //! At the bottom of this file we have our user logic.
 
+use codec::{Decode, Encode};
+use core::slice;
 use futures::{
     channel::mpsc, executor::block_on, future::BoxFuture, pin_mut, poll, select_biased, FutureExt,
 };
-use messaging::{next_message, send_message, Message};
+use messaging::{next_message, send_message, Message, call_task};
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex, OnceLock},
@@ -113,6 +115,26 @@ pub unsafe extern "C" fn service() {
     }
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn call(call: *const u8, len: u32) -> u64 {
+    let data = slice::from_raw_parts(call, len as usize);
+    let call = Call::decode(&mut &data[..]).unwrap();
+
+    let res = Ok::<_, CallResult>(call.dispatch()).encode().into_boxed_slice();
+    let res = Box::leak(res);
+
+    let mut ptr = res.len() as u64;
+    ptr <<= 32;
+    ptr |= res.as_ptr() as u64;
+
+    ptr
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn free_memory(ptr: *mut u8) {
+    let _ = Box::from_raw(ptr);
+}
+
 /// Maybe yield, depending on if the `executor` requested us to `yield` or not.
 ///
 /// `Yield` means that this function will return `Poll::Pending` to give back
@@ -133,10 +155,28 @@ async fn maybe_yield() {
 // The rest of the "magic" should be abstractable.
 // --------------------------------------------------------------------
 
+#[derive(Encode, Decode)]
+enum Call {
+    DoSomething(u32),
+}
+
+#[derive(Encode, Decode, Debug)]
+enum CallResult {
+    DoSomethingR(u32),
+}
+
+impl Call {
+    fn dispatch(&self) -> CallResult {
+        match self {
+            Self::DoSomething(r) => CallResult::DoSomethingR(*r),
+        }
+    }
+}
+
 /// The main function of our task.
 async fn main(messages: Messages) {
-    let never_return = never_return().fuse();
-    pin_mut!(never_return);
+    // let never_return = never_return().fuse();
+    // pin_mut!(never_return);
 
     // The main loop
     loop {
@@ -149,11 +189,17 @@ async fn main(messages: Messages) {
                         match message {
                             Message::Ping => { send_message(Message::Pong); },
                             Message::Pong => { send_message(Message::Ping); },
+                            Message::Call(task_id) => {
+                                match call_task::<CallResult>(task_id, &Call::DoSomething(10)) {
+                                    Ok(res) => print(format!("Task {task_id:?} returned: {res:?}")),
+                                    Err(e) => print(format!("Calling task {task_id:?} returned an error: {e:?}")),
+                                }
+                            }
                         }
                     }
                 }
             },
-            _ = never_return => {},
+            // _ = never_return => {},
         }
     }
 }

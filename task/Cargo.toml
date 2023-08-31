@@ -10,3 +10,4 @@ crate-type = ["cdylib"]
 environmental = "1.1.4"
 futures = "0.3.28"
 messaging = { path = "../messaging" }
+codec = { package = "parity-scale-codec", version = "3.6.4", features = [ "derive" ] }
