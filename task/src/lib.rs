@@ -11,9 +11,10 @@ use core::slice;
 use futures::{
     channel::mpsc, executor::block_on, future::BoxFuture, pin_mut, poll, select_biased, FutureExt,
 };
-use messaging::{next_message, send_message, Message, call_task};
+use messaging::{call_task, next_message, send_message, Message};
 use std::{
     collections::VecDeque,
+    mem,
     sync::{Arc, Mutex, OnceLock},
 };
 
@@ -120,19 +121,30 @@ pub unsafe extern "C" fn call(call: *const u8, len: u32) -> u64 {
     let data = slice::from_raw_parts(call, len as usize);
     let call = Call::decode(&mut &data[..]).unwrap();
 
-    let res = Ok::<_, CallResult>(call.dispatch()).encode().into_boxed_slice();
-    let res = Box::leak(res);
+    let res = Ok::<_, CallResult>(call.dispatch()).encode();
 
     let mut ptr = res.len() as u64;
     ptr <<= 32;
-    ptr |= res.as_ptr() as u64;
+    ptr |= res.as_ptr() as *const u8 as u64;
+
+    mem::forget(res);
 
     ptr
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn free_memory(ptr: *mut u8) {
-    let _ = Box::from_raw(ptr);
+pub unsafe extern "C" fn free_memory(ptr: *mut u8, len: u32) {
+    drop(Box::from_raw(slice::from_raw_parts_mut(ptr, len as usize)));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn allocate_memory(len: u32) -> u32 {
+    let vec = Vec::with_capacity(len as usize);
+
+    let ptr: *const u8 = vec.as_ptr();
+    mem::forget(vec);
+
+    ptr as u32
 }
 
 /// Maybe yield, depending on if the `executor` requested us to `yield` or not.

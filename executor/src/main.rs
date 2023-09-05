@@ -7,11 +7,14 @@ use anyhow::Result;
 use codec::{Decode, Encode};
 use futures::{
     channel::{mpsc, oneshot},
-    pin_mut, select, FutureExt, SinkExt,
+    pin_mut, select, FutureExt, SinkExt, StreamExt,
 };
 use messaging::{Message, TaskId};
-use std::{sync::{Arc, Mutex}, collections::HashMap};
 use std::time::Duration;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 use tokio::runtime::Handle;
 use wasmtime::*;
 
@@ -41,19 +44,23 @@ struct StoreData(Arc<Mutex<StoreDataInner>>);
 struct Task {
     name: String,
     store_data: StoreData,
-    service_fn: Option<Func>,
+    service_fn: Arc<Mutex<Option<Func<(), ()>>>>,
+    call_fn: Arc<Mutex<Option<Func<(u32, u32), u64>>>>,
+    allocate_fn: Arc<Mutex<Option<Func<u32, u32>>>>,
+    free_fn: Arc<Mutex<Option<Func<(u32, u32), ()>>>>,
+    task_id: TaskId,
 }
 
 /// A simple wrapper that represents a function in wasm.
-struct Func {
+struct Func<P, R> {
     store: Store<StoreData>,
     _instance: Instance,
-    func: TypedFunc<(), ()>,
+    func: TypedFunc<P, R>,
 }
 
-impl Func {
-    async fn call(&mut self) -> Result<()> {
-        self.func.call_async(&mut self.store, ()).await
+impl<P: WasmParams, R: WasmResults> Func<P, R> {
+    async fn call(&mut self, params: P) -> Result<R> {
+        self.func.call_async(&mut self.store, params).await
     }
 }
 
@@ -68,6 +75,51 @@ impl Task {
 
     fn set_yield(&self, _yield: bool) {
         self.store_data.0.lock().unwrap().should_yield = _yield;
+    }
+
+    fn read_memory(&self, offset: u32, len: u32) -> Vec<u8> {
+        let store = self.store_data.0.lock().unwrap();
+
+        let mut res = vec![0u8; len as usize];
+
+        unsafe {
+            let memory: *mut u8 = std::mem::transmute(store.memory.data().as_ptr());
+
+            memory
+                .offset(offset as isize)
+                .copy_to(res.as_mut_ptr(), len as usize);
+        }
+
+        res
+    }
+
+    fn write_memory(&self, offset: u32, data: &[u8]) {
+        let store = self.store_data.0.lock().unwrap();
+
+        unsafe {
+            let memory: *mut u8 = std::mem::transmute(store.memory.data().as_ptr());
+
+            memory
+                .offset(offset as isize)
+                .copy_from(data.as_ptr(), data.len());
+        }
+    }
+
+    async fn allocate_memory(&self, len: u32) -> u32 {
+        let mut allocate_fn = self.allocate_fn.lock().unwrap().take().unwrap();
+
+        let res = allocate_fn.call(len).await.unwrap();
+
+        *self.allocate_fn.lock().unwrap() = Some(allocate_fn);
+        res
+    }
+
+    async fn free_memory(&self, ptr: u32, len: u32) {
+        let mut free_memory = self.free_fn.lock().unwrap().take().unwrap();
+
+        free_memory.call((ptr, len)).await;
+
+        *self.free_fn.lock().unwrap() = Some(free_memory);
     }
 }
 
@@ -185,6 +237,8 @@ fn create_linker(
                 panic!("Invalid `call_task` argument");
             }
 
+             println!("call_task");
+
             let store_data = (*caller.data()).clone();
             let store = store_data.0.lock().unwrap();
             let mut buffer = vec![0; call_len as usize];
@@ -215,7 +269,8 @@ fn create_linker(
                         call: buffer,
                         result: result_sender,
                     })
-                    .await.unwrap();
+                    .await
+                    .unwrap();
 
                 let result = result_recv.await.unwrap();
 
@@ -241,18 +296,19 @@ fn create_linker(
     Ok(linker)
 }
 
-/// Create an instance of `Func` that holds the `service` function.
-async fn service_fn(
+/// Create an instance of `Func` that holds the given `function`.
+async fn get_fn<P: WasmParams, R: WasmResults>(
+    function: &str,
     store_data: &StoreData,
     engine: &Engine,
     module: &Module,
     shared_memory: &SharedMemory,
-) -> Result<Func> {
+) -> Result<Func<P, R>> {
     let mut store = Store::new(&engine, store_data.clone());
     let linker = create_linker(&mut store, engine, shared_memory)?;
     let instance = linker.instantiate_async(&mut store, module).await?;
 
-    let func = instance.get_typed_func(&mut store, "service")?;
+    let func = instance.get_typed_func::<P, R>(&mut store, function)?;
 
     Ok(Func {
         func,
@@ -291,83 +347,106 @@ async fn create_task(
     })));
 
     // TODO: Find out why changing the order of these functions make the TLS fail.
-    let service_fn = service_fn(&store_data, &engine, &module, &shared_memory).await?;
+    let service_fn = get_fn("service", &store_data, &engine, &module, &shared_memory).await?;
+    let call_fn = get_fn("call", &store_data, &engine, &module, &shared_memory).await?;
+    let allocate_fn = get_fn(
+        "allocate_memory",
+        &store_data,
+        &engine,
+        &module,
+        &shared_memory,
+    )
+    .await?;
+    let free_fn = get_fn("free_memory", &store_data, &engine, &module, &shared_memory).await?;
+
+    let mut task_id = [0u8; 32];
+    task_id[..name.as_bytes().len()].copy_from_slice(name.as_bytes());
 
     Ok(Task {
         name,
         store_data,
-        service_fn: Some(service_fn),
+        service_fn: Arc::new(Mutex::new(Some(service_fn))),
+        call_fn: Arc::new(Mutex::new(Some(call_fn))),
+        allocate_fn: Arc::new(Mutex::new(Some(allocate_fn))),
+        free_fn: Arc::new(Mutex::new(Some(free_fn))),
+        task_id,
     })
+}
+
+pub fn unpack_ptr_and_len(val: u64) -> (u32, u32) {
+    let ptr = (val & (!0u32 as u64)) as u32;
+    let len = (val >> 32) as u32;
+
+    (ptr, len)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     println!("Initializing...");
 
-    let (request_sender, request_recv) = mpsc::channel(1);
+    let (request_sender, mut request_recv) = mpsc::channel(1);
 
     let task_a = create_task("task_a", request_sender.clone()).await?;
     let task_b = create_task("task_b", request_sender.clone()).await?;
 
     // Let's start with some message for `task_a`.
-    task_a.send_message(Message::Ping);
+    task_a.send_message(Message::Call(task_b.task_id));
 
-    let mut tasks = HashMap::new();
+    let task_a_running = run_task(&task_a).fuse();
+    pin_mut!(task_a_running);
 
-    tasks.insert([1; 32], task_a);
-    tasks.insert([2; 32], task_b);
+    select! {
+        _ = task_a_running => {},
+        request = request_recv.select_next_some() => {
+            match request {
+                TaskRequest::Call {
+                    target,
+                    call,
+                    result,
+                } => {
+                    if target == task_b.task_id {
+                        let ptr = task_b.allocate_memory(call.len() as u32).await;
+                        task_b.write_memory(ptr, &call);
+                        let mut call_fn = task_b.call_fn.lock().unwrap().take().unwrap();
+                        let res = call_fn.call((ptr, call.len() as u32)).await?;
+                        *task_b.call_fn.lock().unwrap() = Some(call_fn);
+                        task_b.free_memory(ptr, call.len() as u32).await;
 
-    let mut messages_to_send = vec![];
+                        let (ptr, len) = unpack_ptr_and_len(res);
+                        let res = task_b.read_memory(ptr, len);
+                        task_b.free_memory(ptr, len).await;
 
-    // Interleave the execution between both tasks.
-    for task_i in 0.. {
-        let index = task_i % tasks.len();
-        let task = &mut tasks.values_mut().nth(index).unwrap();
-
-        messages_to_send
-            .drain(..)
-            .for_each(|m| task.send_message(m));
-
-        println!("Scheduling task: {}", task.name);
-
-        // Reset the `yield` signal.
-        task.set_yield(false);
-        let mut service_fn = task.service_fn.take().unwrap();
-
-        // We need to `spawn` the `service` function. While the `call` function is async,
-        // `wasmtime` still runs the wasm execution in the `poll` function.
-        // Thus, to not block our execution we need to run it on another thread.
-        let service_call = tokio::task::spawn_blocking(move || {
-            Handle::current().block_on(async move {
-                service_fn.call().await?;
-                Ok::<_, anyhow::Error>(service_fn)
-            })
-        })
-        .fuse();
-        // Let's give each task `100ms`.
-        let timeout = futures_timer::Delay::new(Duration::from_millis(100)).fuse();
-
-        pin_mut!(service_call);
-        pin_mut!(timeout);
-
-        select! {
-            // This should actually never return, as we only return when we set
-            // the `yield` signal right now.
-            res = service_call => {
-                println!("Task {} service fn returned, is_err={}", task.name, res.is_err());
-                task.service_fn = Some(res??);
-            },
-            _ = timeout => {
-                println!("Yielding task {}", task.name);
-                // Let's set the yield signal.
-                task.set_yield(true);
-                // Wait until the `service` function returns.
-                task.service_fn = Some(service_call.await??);
+                        result.send(res);
+                    } else {
+                        unimplemented!("Not supported right now")
+                    }
+                }
             }
         }
-
-        messages_to_send.extend(task.drain_messages_to_send());
     }
 
     Ok(())
+}
+
+async fn run_task(task: &Task) {
+    println!("Scheduling task: {}", task.name);
+
+    // Reset the `yield` signal.
+    task.set_yield(false);
+    let mut service_fn = task.service_fn.lock().unwrap().take().unwrap();
+
+    // We need to `spawn` the `service` function. While the `call` function is async,
+    // `wasmtime` still runs the wasm execution in the `poll` function.
+    // Thus, to not block our execution we need to run it on another thread.
+    let service_fn = tokio::task::spawn_blocking(move || {
+        Handle::current().block_on(async move {
+            service_fn.call(()).await?;
+            Ok::<_, anyhow::Error>(service_fn)
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    *task.service_fn.lock().unwrap() = Some(service_fn);
 }
